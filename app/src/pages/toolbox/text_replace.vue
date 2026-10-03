@@ -82,16 +82,33 @@
           <template v-if="selected">
             <v-divider class="mb-4" />
 
+            <!-- Format selection (only when both TXT and EPUB exist) -->
+            <div v-if="bookFormats.length > 1" class="mb-3">
+              <div class="caption font-weight-medium mb-1">{{ $t('textReplace.formatLabel') }}</div>
+              <v-radio-group v-model="selectedFormat" dense row class="mt-0">
+                <v-radio
+                  v-for="f in bookFormats"
+                  :key="f"
+                  :label="f"
+                  :value="f"
+                  color="primary"
+                />
+              </v-radio-group>
+            </div>
+            <div v-else-if="bookFormats.length === 1" class="caption grey--text mb-3">
+              {{ $t('textReplace.formatOnly', { format: bookFormats[0] }) }}
+            </div>
+
             <!-- Mode switch -->
             <v-radio-group v-model="useRegex" dense row class="mt-1 mb-3">
               <v-radio :label="$t('textReplace.modePlain')" :value="false" />
               <v-radio :label="$t('textReplace.modeRegex')" :value="true" />
             </v-radio-group>
 
-            <!-- Regex cheat sheet -->
+            <!-- Cheat sheet -->
             <v-alert
               v-if="useRegex"
-              type="secondary"
+              color="secondary"
               dense
               text
               rounded="lg"
@@ -167,6 +184,14 @@
                   {{ $t('textReplace.previewTitle', { format: previewResult.format, count: previewResult.matches }) }}
                 </v-card-title>
                 <v-card-text class="pt-0">
+                  <v-alert
+                    v-if="previewResult.truncated"
+                    type="warning"
+                    dense
+                    text
+                    rounded="lg"
+                    class="mb-3"
+                  >{{ $t('textReplace.previewTruncated') }}</v-alert>
                   <div v-if="previewResult.matches === 0" class="caption grey--text">
                     {{ $t('textReplace.previewZero') }}
                   </div>
@@ -177,9 +202,9 @@
                   >
                     <div class="caption grey--text mb-1">{{ $t('textReplace.sampleIndex', { index: sample.index }) }}</div>
                     <v-sheet outlined rounded="lg" class="pa-2 tr-sample-text">
-                      <span>{{ sampleParts(sample).pre }}</span>
-                      <mark class="tr-mark">{{ sampleParts(sample).match }}</mark>
-                      <span>{{ sampleParts(sample).post }}</span>
+                      <span>{{ sample.pre }}</span>
+                      <mark class="tr-mark">{{ sample.match }}</mark>
+                      <span>{{ sample.post }}</span>
                     </v-sheet>
                   </div>
                 </v-card-text>
@@ -237,6 +262,7 @@ export default {
     searching: false,
     searched: false,
     selected: null,
+    selectedFormat: '',
 
     useRegex: false,
     pattern: '',
@@ -255,8 +281,16 @@ export default {
     pollTimer: null,
   }),
   computed: {
-    canSelect() {
-      return this.selected && (this.selected.files || []).some((f) => ['EPUB', 'TXT'].indexOf(f.format) >= 0);
+    bookFormats() {
+      if (!this.selected || !this.selected.files) return [];
+      const fmts = [];
+      for (const f of this.selected.files) {
+        const fmt = (f.format || '').toUpperCase();
+        if ((fmt === 'TXT' || fmt === 'EPUB') && !fmts.includes(fmt)) {
+          fmts.push(fmt);
+        }
+      }
+      return fmts;
     },
   },
   created() {
@@ -266,7 +300,15 @@ export default {
     this.stopPolling();
   },
   methods: {
+    searchDebounce: null,
     async search() {
+      // 防抖：连按回车/快速输入时只发最后一个请求
+      clearTimeout(this.searchDebounce);
+      this.searchDebounce = setTimeout(() => {
+        this.doSearch();
+      }, 300);
+    },
+    async doSearch() {
       const q = (this.query || '').trim();
       if (!q) return;
       this.searching = true;
@@ -289,21 +331,13 @@ export default {
     },
     selectBook(book) {
       this.selected = this.selected && this.selected.id === book.id ? null : book;
+      const fmts = book.files
+        ? book.files.map(f => (f.format || '').toUpperCase()).filter(f => f === 'TXT' || f === 'EPUB')
+        : [];
+      this.selectedFormat = fmts.includes('EPUB') ? 'EPUB' : (fmts.includes('TXT') ? 'TXT' : '');
       this.previewResult = null;
       this.previewError = '';
       this.resultMsg = '';
-    },
-    // 将样本拆成 上下文 + 命中段 + 上下文，用于高亮
-    sampleParts(sample) {
-      const idx = sample.before.indexOf(sample.matched);
-      if (idx < 0) {
-        return { pre: sample.before, match: '', post: '' };
-      }
-      return {
-        pre: sample.before.slice(0, idx),
-        match: sample.matched,
-        post: sample.before.slice(idx + sample.matched.length),
-      };
     },
     stageText(stage) {
       const map = {
@@ -368,6 +402,7 @@ export default {
             pattern: this.pattern,
             replacement: this.replacement,
             use_regex: this.useRegex,
+            format: this.selectedFormat,
           }),
         });
         if (rsp.err === 'ok') {
@@ -398,6 +433,7 @@ export default {
             replacement: this.replacement,
             use_regex: this.useRegex,
             suffix: this.suffix || this.$t('textReplace.defaultSuffix'),
+            format: this.selectedFormat,
           }),
         });
         if (rsp.err === 'ok') {

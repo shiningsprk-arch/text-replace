@@ -12,64 +12,66 @@
 - **EPUB**：zipfile 遍历（`META-INF/container.xml` → OPF manifest → xhtml 正文条目）
   逐文件替换；**未修改条目字节原样保留**；按 EPUB 规范重写
   （`mimetype` 置首且 `ZIP_STORED`）→ 新书入库；
-- **预览**：同步返回命中数 + 上下文样本（含命中段高亮位置）+ 正则错误提示；
+- **预览**：同步返回命中数 + 上下文样本（pre / match / post 三段直出高亮）+
+  正则错误提示；超过 `PREVIEW_LIMIT`（20 万字符）只统计前缀并置 `truncated`；
+- **格式选择**：可显式指定 TXT / EPUB，默认 **EPUB 优先**（其次 TXT）；
 - 新书标题默认追加「正文替换版」后缀，可自定义。
 
 ## API
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| POST | `/api/toolbox/text_replace/preview` | 同步 `{book_id, pattern, replacement, use_regex}` → `format / matches / samples / regex_error` |
-| POST | `/api/toolbox/text_replace/run` | 后台执行 `{book_id, pattern, replacement, use_regex, suffix}` → 新书入库 |
+| POST | `/api/toolbox/text_replace/preview` | 同步 `{book_id, pattern, replacement, use_regex, format?}` → `format / matches / samples / regex_error / truncated` |
+| POST | `/api/toolbox/text_replace/run` | 后台执行 `{book_id, pattern, replacement, use_regex, suffix, format?}` → 新书入库 |
 | GET | `/api/toolbox/text_replace/progress` | 轮询 `status / progress / stage` |
 
 ## 文件清单
 
+> 本仓库与 **mybooks v4.4.1（47354337）** 全量对齐：下列「覆盖」文件与 v4.4.1
+> 宿主自带内容一致，宿主为 v4.4.1 时覆盖等于无操作；其余为新增文件。
+
 ```
-正文查找替换/
+text-replace/
 ├── README.md
 ├── webserver/
-│   ├── handlers/toolbox.py            # 修改版：+3 handler（preview/run/progress）+3 路由
+│   ├── handlers/toolbox.py            # 覆盖 = v4.4.1 原样（含全部工具 handler + text_replace 3 路由）
 │   └── toolbox/
-│       ├── toolset.py                 # 修改版：+2 import +2 register（含 txt_encoding_fixer，见下）
+│       ├── toolset.py                 # 覆盖 = v4.4.1 原样（含全部工具注册）
 │       ├── text_replace.py            # 插件主体（Tool 类 + EPUB zip 助手）
-│       ├── encoding_detect.py         # 公共模块①：编码检测（与 txt_encoding_fixer 共享）
-│       └── book_utils.py              # 公共模块②：get_book_file / import_as_new_book
+│       └── utils/
+│           ├── encoding_detect.py     # 公共模块①：编码检测（与 txt_encoding_fixer 共享）
+│           └── book_utils.py          # 公共模块②：get_book_file / import_as_new_book
 ├── app/
 │   ├── src/pages/toolbox/text_replace.vue           # Vue 2.6 + Vuetify 2 页面
-│   └── locales/{en,zh,zh-TW}.json     # 修改版：+textReplace 块（另含 txtEncodingFixer 块，见下）
-└── tests/test_text_replace_core.py    # standalone 单测（11 个）
+│   └── locales/{en,zh,zh-TW}.json     # 覆盖 = v4.4.1 原样（含 textReplace 等全部词条）
+└── tests/test_text_replace_core.py    # standalone 单测（22 个）
 ```
 
-## 安装部署（4 处修改）
+## 安装部署
 
 将以下文件复制到 mybooks 源码对应位置：
 
 | 源文件 | 目标位置 |
 |--------|----------|
 | `webserver/toolbox/text_replace.py` | `webserver/toolbox/` |
-| `webserver/toolbox/encoding_detect.py` | `webserver/toolbox/` |
-| `webserver/toolbox/book_utils.py` | `webserver/toolbox/` |
+| `webserver/toolbox/utils/encoding_detect.py` | `webserver/toolbox/utils/` |
+| `webserver/toolbox/utils/book_utils.py` | `webserver/toolbox/utils/` |
 | `webserver/toolbox/toolset.py` | **覆盖** `webserver/toolbox/toolset.py` |
 | `webserver/handlers/toolbox.py` | **覆盖** `webserver/handlers/toolbox.py` |
 | `app/src/pages/toolbox/text_replace.vue` | `app/src/pages/toolbox/` |
 | `app/locales/en.json` / `zh.json` / `zh-TW.json` | **覆盖** `app/locales/` 同名文件 |
 
+> **宿主版本注意**：`toolset.py` / `handlers/toolbox.py` / locales 为 v4.4.1 全量
+> 文件，会无条件 import v4.4.1 工具箱的全部插件（含 `TxtEncodingFixerTool` 等）。
+> 宿主为 **v4.4.1** 时直接覆盖即可；宿主**低于该版本**时，请删除修改版中宿主缺失
+> 工具的引用（toolset.py 的 import + register、handlers/toolbox.py 的 import +
+> 对应 handler 类 + 路由），或优先升级宿主。
+
 ### 与「TXT编码修复」插件的关系
 
-两个插件共享 `encoding_detect.py` / `book_utils.py`，且本文件夹的修改版
-`toolset.py` 与 `handlers/toolbox.py` **已同时包含两个插件的注册与路由**
-（6 handler + 6 路由），locales 亦同时含 `textReplace` + `txtEncodingFixer` 两块：
-
-- 只装本插件：直接按上表复制即可（多余的另一插件注册行无害——见下方注意）；
-- 同时装两个：将 `TXT编码修复` 文件夹中的 `txt_encoding_fixer.py` 一并复制即可，
-  **两个文件夹的修改版文件内容一致，任取其一**，无需手工合并。
-
-> 注意：本文件夹 `toolset.py` / `handlers/toolbox.py` 会 import
-> `TxtEncodingFixerTool`。若**只装本插件**，请删除修改版中的这两处引用
-> （`toolset.py` 的 import + register 各 1 行；`toolbox.py` 的 import 1 行 +
-> `AdminTxtEncodingFixer*` 3 个 handler + 3 条路由），或直接改用
-> `TXT编码修复` 文件夹中同名的修改版（内容一致，反向删 `TextReplaceTool` 引用）。
+两个插件共享 `utils/encoding_detect.py` / `utils/book_utils.py`。同时安装时，
+将「TXT编码修复」包中的 `txt_encoding_fixer.py` 复制到 `webserver/toolbox/`
+即可，无需手工合并（两包的共享模块与覆盖文件同源）。
 
 ### 依赖
 
@@ -79,13 +81,14 @@
 
 ```bash
 python -m unittest discover -s tests -v
-# 或：python tests/test_text_replace_core.py
+# 或：python -m pytest tests/test_text_replace_core.py -q
 ```
 
 覆盖：普通 / 正则（含 `\1` 分组引用）/ 非法正则 / 空 pattern 的错误处理、
-上下文样本收集、TXT GB18030 原编码写回、EPUB 正文条目定位（container→OPF→xhtml）、
+上下文样本收集与全文命中统计、格式选择（显式指定 / EPUB 优先）、
+TXT GB18030 原编码写回、EPUB 正文条目定位（container→OPF→xhtml）、
 逐文件替换 + mimetype 首条 `ZIP_STORED` 规范断言、未修改文件字节保留、
-条目解码 UTF-8 失败兜底。
+条目解码 UTF-8 失败兜底、原编码无法表示时降级 UTF-8 并同步 XML 声明。
 
 ## 测试库实测步骤
 

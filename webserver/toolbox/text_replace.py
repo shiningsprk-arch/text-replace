@@ -28,8 +28,8 @@ from webserver.services import AsyncService
 from webserver.services.background_service import BackgroundService, BackgroundTask
 from webserver.toolbox.base_tool import BaseTool
 
-from . import book_utils
-from . import encoding_detect
+from webserver.toolbox.utils import book_utils
+from webserver.toolbox.utils import encoding_detect
 
 # EPUB 文本条目（正文）的 media-type
 _TEXT_MEDIA_TYPES = ("application/xhtml+xml", "text/html")
@@ -39,6 +39,7 @@ _ITEM_MT_RE = re.compile(r'media-type\s*=\s*"([^"]+)"', re.IGNORECASE)
 
 SAMPLE_CTX = 50   # 预览上下文（前后各 N 字符）
 SAMPLE_MAX = 5    # 预览样本条数上限
+PREVIEW_LIMIT = 200000  # 预览统计 / 采样的最大字符数（防病态正则 / 超大书卡死请求线程）
 
 
 class TextReplaceTool(BaseTool):
@@ -92,58 +93,103 @@ class TextReplaceTool(BaseTool):
                               text.count(pattern))), None
 
     @staticmethod
+    def _sample_from(text: str, idx: int, length: int) -> dict:
+        """构造单条上下文样本（pre / match / post 三段，前端直接渲染高亮）。"""
+        lo, hi = max(0, idx - SAMPLE_CTX), min(len(text), idx + length + SAMPLE_CTX)
+        return {
+            "index": idx,
+            "pre": text[lo:idx],
+            "match": text[idx:idx + length],
+            "post": text[idx + length:hi],
+        }
+
+    @staticmethod
+    def _scan_samples(text: str, pattern: str, use_regex: bool, cap: int = SAMPLE_MAX):
+        """单次扫描统计命中数并收集上下文样本，避免预览时对全文重复扫描。
+
+        普通模式按非重叠匹配（与 ``str.replace`` / ``str.count`` 一致）；
+        正则模式单趟 ``finditer`` 同时计数与采样。
+
+        :return: (count, samples)
+        """
+        samples = []
+        if use_regex:
+            rx = re.compile(pattern)
+            count = 0
+            for m in rx.finditer(text):
+                count += 1
+                if len(samples) < cap:
+                    samples.append(TextReplaceTool._sample_from(
+                        text, m.start(), m.end() - m.start()))
+            return count, samples
+        if not pattern:
+            return 0, samples
+        count = 0
+        start = 0
+        while True:
+            idx = text.find(pattern, start)
+            if idx < 0:
+                break
+            count += 1
+            if len(samples) < cap:
+                samples.append(TextReplaceTool._sample_from(text, idx, len(pattern)))
+            start = idx + max(1, len(pattern))
+        return count, samples
+
+    @staticmethod
     def _collect_samples(text: str, pattern: str, use_regex: bool) -> List[dict]:
         """收集匹配上下文样本，用于预览。"""
-        samples: List[dict] = []
-        if use_regex:
-            matches = list(re.finditer(pattern, text))
-        else:
-            matches = []
-            start = 0
-            while len(matches) < SAMPLE_MAX:
-                idx = text.find(pattern, start)
-                if idx < 0:
-                    break
-                matches.append(idx)
-                start = idx + max(1, len(pattern))
-        for m in matches[:SAMPLE_MAX]:
-            idx = m.start() if use_regex else m
-            length = (m.end() - m.start()) if use_regex else len(pattern)
-            lo, hi = max(0, idx - SAMPLE_CTX), min(len(text), idx + length + SAMPLE_CTX)
-            samples.append({
-                "index": idx,
-                "before": text[lo:hi],
-                "matched": text[idx:idx + length],
-            })
+        _, samples = TextReplaceTool._scan_samples(text, pattern, use_regex)
         return samples
 
     # ------------------------------------------------------------ 预览（同步）
 
-    def preview(self, book_id: int, pattern: str, replacement: str, use_regex: bool) -> dict:
+    @AsyncService.register_function
+    def preview(self, book_id: int, pattern: str, replacement: str, use_regex: bool,
+                fmt: Optional[str] = None) -> dict:
         """同步返回匹配数 + 上下文样本 + 正则错误。
 
         :param book_id:    Calibre 书籍 ID。
         :param pattern:    查找内容（普通文本或正则表达式）。
         :param replacement: 替换内容。
         :param use_regex:  是否按正则解析 pattern。
+        :param fmt:        指定格式（TXT / EPUB，大写）；不指定时自动选择（EPUB 优先）。
         :return dict: ``format``（TXT / EPUB）/ ``matches`` / ``samples`` /
-            ``regex_error``。
-        :raises RuntimeError: 书籍不存在 / 无 TXT、EPUB 格式 / 文件缺失。
+            ``regex_error`` / ``truncated``（是否因超过 PREVIEW_LIMIT 只统计了前缀）。
+        :raises RuntimeError: 书籍不存在 / 无 TXT、EPUB 格式 / 指定格式缺失 / 文件缺失。
         """
         apply_fn, regex_error = self._compile(pattern, replacement, use_regex)
         if apply_fn is None:
-            return {"format": None, "matches": 0, "samples": [], "regex_error": regex_error}
+            return {"format": None, "matches": 0, "samples": [], "regex_error": regex_error,
+                    "truncated": False}
 
-        fmt, text = self._load_text(book_id)
-        _, count = apply_fn(text)
-        samples = self._collect_samples(text, pattern, use_regex)
-        return {"format": fmt, "matches": count, "samples": samples, "regex_error": None}
+        fmt, texts = self._load_texts(book_id, fmt)
+        total = 0
+        samples: List[dict] = []
+        truncated = False
+        offset = 0
+        for full_text in texts:
+            if len(full_text) > PREVIEW_LIMIT:
+                truncated = True
+            text = full_text[:PREVIEW_LIMIT]
+            count, entry_samples = self._scan_samples(text, pattern, use_regex,
+                                                      cap=SAMPLE_MAX - len(samples))
+            total += count
+            for s in entry_samples:
+                s["index"] += offset
+                samples.append(s)
+            if len(samples) >= SAMPLE_MAX:
+                break
+            offset += len(full_text)
+        return {"format": fmt, "matches": total, "samples": samples,
+                "regex_error": None, "truncated": truncated}
 
     # ------------------------------------------------------------- 后台执行
 
     @AsyncService.register_service
     def run(self, book_id: int, pattern: str, replacement: str,
-            use_regex: bool, suffix: str, user_id: int) -> None:
+            use_regex: bool, suffix: str, user_id: int,
+            fmt: Optional[str] = None) -> None:
         """后台执行查找替换并生成新书。
 
         :param book_id:    Calibre 书籍 ID。
@@ -152,6 +198,7 @@ class TextReplaceTool(BaseTool):
         :param use_regex:  是否按正则解析 pattern。
         :param suffix:     新书标题后缀（如「正文替换版」）。
         :param user_id:    操作用户 ID。
+        :param fmt:        指定格式（TXT / EPUB，大写）；不指定时自动选择（EPUB 优先）。
         """
         if not TextReplaceTool._run_lock.acquire(blocking=False):
             logging.warning(
@@ -160,20 +207,23 @@ class TextReplaceTool(BaseTool):
             )
             return
 
-        task_id = self.create_task(progress_data={"status": "starting", "book_id": book_id})
-        TextReplaceTool._last_task_id = task_id
-        progress_callback = self.make_progress_callback(task_id)
+        # create_task 等全部放入 try：若中途抛异常，finally 仍会释放锁
+        task_id = None
         error_message = None
         book_title = "Unknown"
 
         try:
+            task_id = self.create_task(progress_data={"status": "starting", "book_id": book_id})
+            TextReplaceTool._last_task_id = task_id
+            progress_callback = self.make_progress_callback(task_id)
+
             apply_fn, regex_error = self._compile(pattern, replacement, use_regex)
             if apply_fn is None:
                 error_message = regex_error
                 logging.error("[TextReplaceTool] Bad rule: %s [uid:%d]", regex_error, user_id)
                 return
 
-            books = self.db.get_data_as_dict(ids=[book_id])
+            books = self.api.calibre.get_data_as_dict([book_id])
             if not books:
                 error_message = _("书籍不存在：ID=%d") % book_id
                 logging.error("[TextReplaceTool] Book not found: ID=%d [uid:%d]", book_id, user_id)
@@ -184,7 +234,12 @@ class TextReplaceTool(BaseTool):
             self.update_task_progress(task_id, 10, {"status": "running", "stage": "reading"})
             progress_callback(10)
 
-            fmt = self._detect_format(book)
+            try:
+                fmt = self._detect_format(book, fmt)
+            except RuntimeError as err:
+                error_message = str(err)
+                logging.error("[TextReplaceTool] %s for book_id=%d [uid:%d]", error_message, book_id, user_id)
+                return
             if fmt is None:
                 error_message = _("该书籍没有 TXT 或 EPUB 格式，无法执行替换")
                 logging.error("[TextReplaceTool] No TXT/EPUB format for book_id=%d [uid:%d]", book_id, user_id)
@@ -205,7 +260,7 @@ class TextReplaceTool(BaseTool):
             progress_callback(80)
 
             new_book_id = book_utils.import_as_new_book(
-                self, book_id, out_path, suffix or _("「正文替换版」"), user_id,
+                self, book_id, out_path, suffix or _("（正文替换版）"), user_id,
             )
             logging.info(
                 "[TextReplaceTool] Replaced %s book_id=%d (%d hits) -> new book_id=%d [uid:%d]",
@@ -224,49 +279,77 @@ class TextReplaceTool(BaseTool):
             logging.error("[TextReplaceTool] Unexpected error for book_id=%d: %s", book_id, err)
             logging.error(traceback.format_exc())
         finally:
-            self.complete_task(task_id, error_message=error_message)
-            if error_message is None:
-                self.update_task_progress(task_id, 100, {"status": "completed", "book_id": book_id})
+            # create_task 失败时 task_id 为 None，跳过任务收尾（锁仍必须释放）
+            if task_id is not None:
+                self.complete_task(task_id, error_message=error_message)
+                if error_message is None:
+                    self.update_task_progress(task_id, 100, {"status": "completed", "book_id": book_id})
             TextReplaceTool._run_lock.release()
 
     # ------------------------------------------------------------ 内部实现
 
     @staticmethod
-    def _detect_format(book: dict) -> Optional[str]:
-        """确定可用格式：TXT 优先，其次 EPUB；无则返回 None。"""
+    def _detect_format(book: dict, fmt: Optional[str] = None) -> Optional[str]:
+        """确定可用格式。
+
+        :param fmt: 指定格式（TXT / EPUB，大写）；仅在该格式存在时返回；
+            指定但缺失时 raise RuntimeError（带明确提示）。
+        :return: 未指定时按 EPUB 优先、TXT 其次自动选择；无可用格式返回 None。
+        """
         fmts = [f.upper() for f in (book.get("available_formats") or [])]
-        for fmt in ("TXT", "EPUB"):
+        if fmt:
+            fmt = fmt.upper()
+            if fmt not in fmts:
+                raise RuntimeError(_("该书籍没有 %s 格式，无法执行替换") % fmt)
+            return fmt
+        for fmt in ("EPUB", "TXT"):
             if fmt in fmts:
                 return fmt
         return None
 
-    def _load_text(self, book_id: int) -> Tuple[str, str]:
-        """读取书籍 TXT / EPUB 正文并返回 (fmt, 拼接文本)。TXT 优先。"""
-        books = self.db.get_data_as_dict(ids=[book_id])
+    def _load_texts(self, book_id: int, fmt: Optional[str] = None) -> Tuple[str, List[str]]:
+        """读取书籍 TXT / EPUB 正文并返回 (fmt, 文本列表)。
+
+        TXT 返回单段解码文本；EPUB 按 manifest 正文条目逐段返回，
+        与 :meth:`_replace_epub` 的逐条目替换一一对应（预览命中数与实跑一致）。
+
+        :param fmt: 指定格式（TXT / EPUB，大写）；不指定时自动选择（EPUB 优先）。
+        """
+        books = self.api.calibre.get_data_as_dict([book_id])
         book = books[0] if books else {}
         fmts = [f.upper() for f in (book.get("available_formats") or [])]
-        if "TXT" in fmts:
+        if fmt:
+            fmt = fmt.upper()
+            if fmt not in fmts:
+                raise RuntimeError(_("该书籍没有 %s 格式，无法执行替换") % fmt)
+        else:
+            fmt = "EPUB" if "EPUB" in fmts else ("TXT" if "TXT" in fmts else None)
+        if fmt is None:
+            raise RuntimeError(_("该书籍没有 TXT 或 EPUB 格式，无法执行替换"))
+        if fmt == "TXT":
             txt_path = book_utils.get_book_file(self, book_id, "TXT")
             with open(txt_path, "rb") as f:
                 data = f.read()
-            text, _ = encoding_detect.decode_with_report(data)
-            return "TXT", text
-        if "EPUB" in fmts:
-            epub_path = book_utils.get_book_file(self, book_id, "EPUB")
-            entries = _read_zip_entries(epub_path)
-            text = "\n".join(_decode_entry(entries[name]) for name in _find_text_entries(entries))
-            return "EPUB", text
-        raise RuntimeError(_("该书籍没有 TXT 或 EPUB 格式，无法执行替换"))
+            text, enc_report = encoding_detect.decode_with_report(data)
+            return "TXT", [text]
+        epub_path = book_utils.get_book_file(self, book_id, "EPUB")
+        # 预览只读正文条目，避免图片/字体等全量读入内存
+        entries = _read_text_entries(epub_path)
+        texts = [_decode_entry(entries[name])[0] for name in _find_text_entries(entries)]
+        return "EPUB", texts
 
     def _replace_txt(self, book_id: int, apply_fn: Callable, out_path: str) -> int:
-        """TXT：检测编码 → str 替换 → 原编码写回。返回命中数。"""
+        """TXT：检测编码 → str 替换 → 原编码写回。返回命中数。
+
+        替换文本可能包含原编码（如 BIG5）无法表示的字符，此时降级为 UTF-8 写回。
+        """
         txt_path = book_utils.get_book_file(self, book_id, "TXT")
         with open(txt_path, "rb") as f:
             data = f.read()
         text, report = encoding_detect.decode_with_report(data)
         new_text, count = apply_fn(text)
         with open(out_path, "wb") as f:
-            f.write(new_text.encode(report["encoding"]))
+            f.write(_encode_entry(new_text, report["encoding"]))
         return count
 
     def _replace_epub(self, book_id: int, apply_fn: Callable, out_path: str) -> int:
@@ -275,10 +358,10 @@ class TextReplaceTool(BaseTool):
         entries = _read_zip_entries(epub_path)
         total = 0
         for name in _find_text_entries(entries):
-            text = _decode_entry(entries[name])
+            text, enc = _decode_entry(entries[name])
             new_text, count = apply_fn(text)
             if count > 0:
-                entries[name] = new_text.encode("utf-8")
+                entries[name] = _encode_entry(new_text, enc)
                 total += count
         _write_zip(entries, out_path)
         return total
@@ -288,7 +371,10 @@ class TextReplaceTool(BaseTool):
 
 
 def _read_zip_entries(path: str) -> dict:
-    """读取 zip 全部条目（跳过目录项），返回 {name: bytes}。"""
+    """读取 zip 全部条目（跳过目录项），返回 {name: bytes}。
+
+    仅在需要写回全部条目（run 替换）时使用；预览请用 :func:`_read_text_entries`。
+    """
     entries = {}
     with zipfile.ZipFile(path, "r") as zf:
         for info in zf.infolist():
@@ -298,13 +384,58 @@ def _read_zip_entries(path: str) -> dict:
     return entries
 
 
-def _decode_entry(data: bytes) -> str:
-    """解码 EPUB 文本条目：UTF-8 优先，失败则用检测器兜底。"""
+def _read_text_entries(path: str) -> dict:
+    """仅读取正文相关条目（container / OPF / xhtml 文本条目），
+    避免将图片、字体等非文本条目全量读入内存（预览场景）。"""
+    entries = {}
+    with zipfile.ZipFile(path, "r") as zf:
+        all_names = [i.filename for i in zf.infolist() if not i.is_dir()]
+        container_name = "META-INF/container.xml"
+        if container_name in all_names:
+            entries[container_name] = zf.read(container_name)
+        opf_path = _opf_path_from_container(
+            entries.get(container_name, b"").decode("utf-8", errors="replace"))
+        if opf_path and opf_path in all_names:
+            entries[opf_path] = zf.read(opf_path)
+            # 正文条目尚未读入，用"名字视图"（空字节占位）让 manifest 定位可命中；
+            # 已读入的 container/opf 保留真实内容
+            view = dict(entries)
+            view.update({n: b"" for n in all_names if n not in entries})
+            for name in _find_text_entries(view):
+                if name in all_names:
+                    entries[name] = zf.read(name)
+    return entries
+
+
+def _decode_entry(data: bytes) -> Tuple[str, str]:
+    """解码 EPUB 文本条目：UTF-8 优先，失败则用检测器兜底。
+
+    :return: (text, encoding)，encoding 供原编码写回使用。
+    """
     try:
-        return data.decode("utf-8")
+        return data.decode("utf-8"), "utf-8"
     except UnicodeDecodeError:
-        text, _ = encoding_detect.decode_with_report(data)
-        return text
+        text, report = encoding_detect.decode_with_report(data)
+        return text, report["encoding"]
+
+
+def _encode_entry(text: str, enc: str) -> bytes:
+    """按原编码写回；原编码无法表示文本（如 BIG5 遇简体/生僻字）时降级 UTF-8，
+    并同步改写 XML 声明（如有），避免阅读器按声明解码出错。"""
+    if enc in ("utf-8", "utf-8-sig"):
+        return text.encode(enc)
+    try:
+        return text.encode(enc)
+    except (UnicodeEncodeError, LookupError):
+        return _set_xml_encoding(text, "utf-8").encode("utf-8")
+
+
+def _set_xml_encoding(text: str, enc: str) -> str:
+    """改写 XML 声明的 encoding（仅在声明存在时生效）。"""
+    return re.sub(
+        r'(<\?xml[^>]*encoding\s*=\s*")[^"]+(")',
+        r"\g<1>%s\2" % enc, text, count=1, flags=re.IGNORECASE,
+    )
 
 
 def _find_text_entries(entries: dict) -> List[str]:
@@ -315,7 +446,9 @@ def _find_text_entries(entries: dict) -> List[str]:
     opf_path = _opf_path_from_container(container.decode("utf-8", errors="replace"))
     if not opf_path or opf_path not in entries:
         return []
-    opf_text = _decode_entry(entries[opf_path])
+    opf_text = _decode_entry(entries[opf_path])[0]
+    # 大小写不敏感查找（zip 条目名大小写与 manifest 引用可能不一致）
+    lower_map = {k.lower(): k for k in entries}
     names = []
     base_dir = opf_path.rsplit("/", 1)[0] if "/" in opf_path else ""
     for tag in _ITEM_RE.findall(opf_text):
@@ -325,7 +458,8 @@ def _find_text_entries(entries: dict) -> List[str]:
             continue
         if mt.group(1).lower() not in _TEXT_MEDIA_TYPES:
             continue
-        href = href.group(1)
+        # 去掉 fragment / query（如 ch1.xhtml#p1）
+        href = href.group(1).split("#", 1)[0].split("?", 1)[0]
         if href.startswith("/"):
             href = href.lstrip("/")
         elif base_dir:
@@ -341,8 +475,9 @@ def _find_text_entries(entries: dict) -> List[str]:
                 continue
             parts.append(seg)
         name = "/".join(parts)
-        if name in entries:
-            names.append(name)
+        real = lower_map.get(name.lower())
+        if real:
+            names.append(real)
     return names
 
 
