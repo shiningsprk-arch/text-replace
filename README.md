@@ -8,10 +8,16 @@
 对书籍 **TXT / EPUB** 格式的正文执行字符串查找替换（普通文本 / 正则两种模式），
 结果**另存为新书**（原书零改动）：
 
-- **TXT**：检测编码 → str 层替换 → **原编码写回**（BOM 保持）→ 新书入库；
+- **TXT**：检测编码 → str 层替换 → **原编码写回**（UTF-16/32 按 BOM 字节序并
+  保留 BOM，BE 文件不会翻转成 LE）→ 新书入库；原编码无法表示的替换内容
+  （如 BIG5 遇简体字）自动降级 UTF-8 并同步改写 XML 声明；
 - **EPUB**：zipfile 遍历（`META-INF/container.xml` → OPF manifest → xhtml 正文条目）
-  逐文件替换；**未修改条目字节原样保留**；按 EPUB 规范重写
+  逐文件替换；container / OPF 按规范 XML 解析（ElementTree 优先，非良构时正则
+  兜底，属性单双引号均支持），href 按 URI unquote 后比对，文件名含空格
+  （`%20`）可正常定位；**未修改条目字节原样保留**；按 EPUB 规范重写
   （`mimetype` 置首且 `ZIP_STORED`）→ 新书入库；
+- **未命中保护**：查找内容 0 命中时不生成新书（避免入库内容相同的副本），
+  任务正常结束并给出提示；
 - **预览**：同步返回命中数 + 上下文样本（pre / match / post 三段直出高亮）+
   正则错误提示；超过 `PREVIEW_LIMIT`（20 万字符）只统计前缀并置 `truncated`；
 - **格式选择**：可显式指定 TXT / EPUB，默认 **EPUB 优先**（其次 TXT）；
@@ -44,7 +50,9 @@ text-replace/
 ├── app/
 │   ├── src/pages/toolbox/text_replace.vue           # Vue 2.6 + Vuetify 2 页面
 │   └── locales/{en,zh,zh-TW}.json     # 覆盖 = v4.4.1 原样（含 textReplace 等全部词条）
-└── tests/test_text_replace_core.py    # standalone 单测（22 个）
+└── tests/                             # standalone 单测（text_replace 32 + encoding_detect 53）
+    ├── test_text_replace_core.py
+    └── test_encoding_detect.py
 ```
 
 ## 安装部署
@@ -86,9 +94,16 @@ python -m unittest discover -s tests -v
 
 覆盖：普通 / 正则（含 `\1` 分组引用）/ 非法正则 / 空 pattern 的错误处理、
 上下文样本收集与全文命中统计、格式选择（显式指定 / EPUB 优先）、
-TXT GB18030 原编码写回、EPUB 正文条目定位（container→OPF→xhtml）、
-逐文件替换 + mimetype 首条 `ZIP_STORED` 规范断言、未修改文件字节保留、
-条目解码 UTF-8 失败兜底、原编码无法表示时降级 UTF-8 并同步 XML 声明。
+TXT GB18030 原编码写回、UTF-16LE/BE 与 UTF-32BE 按 BOM 字节序写回（BOM 保持）、
+EPUB 正文条目定位（container→OPF→xhtml；单引号属性 / `%20` 编码 href /
+非良构 OPF 正则回退 / fragment 与根路径归一化）、逐文件替换 +
+mimetype 首条 `ZIP_STORED` 规范断言、未修改文件字节保留、
+条目解码 UTF-8 失败兜底、原编码无法表示时降级 UTF-8 并同步 XML 声明、
+run() 命中 0 处不生成新书。
+
+> 设计边界：替换是纯文本层的 str 替换，若替换内容本身含 `<` / `&` / `>`
+> 等标记字符，产出的 XHTML 可能不再良构（例如想插入 `<br/>` 属于刻意用法，
+> 工具不拦截也不校验）——对替换结果有洁癖的请在预览确认后使用。
 
 ## 测试库实测步骤
 
